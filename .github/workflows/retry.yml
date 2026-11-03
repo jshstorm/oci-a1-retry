@@ -77,7 +77,7 @@ jobs:
 
           set +e
           oci compute instance launch -c "$C" --availability-domain "$AD" --display-name "$NAME" \
-            --shape VM.Standard.A1.Flex --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+            --shape VM.Standard.A1.Flex --shape-config '{"ocpus":1,"memoryInGBs":6}' \
             --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
             --ssh-authorized-keys-file ~/.oci/ssh.pub --no-retry > out.txt 2>&1
           rc=$?
