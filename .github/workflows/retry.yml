@@ -1,0 +1,109 @@
+name: retry
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: oci-launch
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SUPPRESS_LABEL_WARNING: "True"
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+      NAME: oci-arm-1
+    steps:
+      - name: Install OCI CLI
+        run: pip install --quiet oci-cli >/dev/null 2>&1 && echo "oci-cli installed"
+
+      - name: Write OCI config
+        env:
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          umask 077
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
+          printf '%s\n' "$SSH_PUBLIC_KEY" > ~/.oci/ssh.pub
+          cat > ~/.oci/config <<CFG
+          [DEFAULT]
+          user=$OCI_USER_OCID
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY_OCID
+          region=$OCI_REGION
+          key_file=$HOME/.oci/key.pem
+          CFG
+          chmod 600 ~/.oci/config ~/.oci/key.pem ~/.oci/ssh.pub
+          echo "config written"
+
+      - name: Launch attempt
+        env:
+          C: ${{ secrets.OCI_TENANCY_OCID }}
+          AD: ${{ secrets.OCI_AD }}
+          IMAGE: ${{ secrets.OCI_IMAGE_OCID }}
+          SUBNET: ${{ secrets.OCI_SUBNET_OCID }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -u
+          sanitize(){ sed -E 's/ocid1\.[A-Za-z0-9._:-]+/<ocid>/g; s/[0-9]{1,3}(\.[0-9]{1,3}){3}/<ip>/g'; }
+          disable_self(){ gh workflow disable retry.yml >/dev/null 2>&1 && echo "workflow disabled" || echo "could not disable workflow"; }
+
+          # Duplicate guard
+          if ! oci compute instance list -c "$C" --all > list.json 2> list.err; then
+            echo "RESULT: instance list failed: $(grep -o '"code": *"[^"]*"' list.err | head -1 | sanitize)"
+            tail -3 list.err | sanitize | head -c 400; echo
+            exit 1
+          fi
+          live=$(jq -r --arg n "$NAME" '[.data[]? | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING" and (.["display-name"] == $n or .shape == "VM.Standard.A1.Flex"))] | length' list.json)
+          if [ "${live:-0}" -gt 0 ]; then
+            echo "RESULT: instance already exists, skipping launch"
+            disable_self
+            exit 0
+          fi
+
+          set +e
+          oci compute instance launch -c "$C" --availability-domain "$AD" --display-name "$NAME" \
+            --shape VM.Standard.A1.Flex --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+            --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
+            --ssh-authorized-keys-file ~/.oci/ssh.pub --no-retry > out.txt 2>&1
+          rc=$?
+          set -e
+
+          if [ $rc -eq 0 ]; then
+            echo "RESULT: SUCCESS - instance launched (details hidden; check from the OCI console/CLI)"
+            disable_self
+            exit 0
+          fi
+
+          code=$(grep -o '"code": *"[^"]*"' out.txt | head -1 | sed 's/.*: *"//;s/"$//')
+          status=$(grep -o '"status": *[0-9]*' out.txt | head -1 | grep -o '[0-9]*$')
+          msg=$(grep -o '"message": *"[^"]*"' out.txt | head -1 | sed 's/.*: *"//;s/"$//' | sanitize)
+          echo "RESULT: rc=$rc code=${code:-?} status=${status:-?} msg=${msg:-?}"
+
+          if [ "${status:-}" = 429 ] || [ "${code:-}" = TooManyRequests ] \
+             || echo "${msg:-}" | grep -qi 'capacity' \
+             || [ "${code:-}" = InternalError ] || [[ "${status:-}" =~ ^5[0-9][0-9]$ ]]; then
+            echo "retryable; will try again on next schedule"
+            exit 0
+          fi
+          echo "unexpected error"
+          tail -5 out.txt | sanitize | head -c 600; echo
+          exit 1
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf ~/.oci out.txt list.json list.err
